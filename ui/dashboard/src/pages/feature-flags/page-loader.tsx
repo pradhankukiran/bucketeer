@@ -16,6 +16,7 @@ import { getDependentFlags } from 'utils/feature-dependencies';
 import ConfirmationRequiredModal, {
   ConfirmRequiredValues
 } from 'pages/feature-flag-details/elements/confirm-required-modal';
+import { SCHEDULE_TYPE_SCHEDULE } from 'pages/feature-flag-details/elements/confirm-required-modal/form-schema';
 import { getFlagStatus } from './collection-layout/elements/utils';
 import AddFlagModal from './flags-modal/add-flag-modal';
 import ArchiveModal from './flags-modal/archive-modal';
@@ -130,16 +131,11 @@ const PageLoader = () => {
     async (additionalValues?: ConfirmRequiredValues) => {
       try {
         if (selectedFlag) {
-          const { scheduleType, comment, scheduleAt } = additionalValues || {};
+          const { scheduleType, comment, resetSampling, scheduleAt } =
+            additionalValues || {};
+          const isSchedule = scheduleType === SCHEDULE_TYPE_SCHEDULE;
           let resp;
-          if (['ENABLE', 'DISABLE'].includes(scheduleType as string)) {
-            resp = await featureUpdater({
-              id: selectedFlag.id,
-              environmentId: currentEnvironment.id,
-              enabled: !selectedFlag.enabled,
-              comment
-            });
-          } else {
+          if (isSchedule) {
             resp = await autoOpsCreator({
               environmentId: currentEnvironment.id,
               featureId: selectedFlag.id,
@@ -151,15 +147,35 @@ const PageLoader = () => {
                 }
               ]
             });
+          } else {
+            resp = await featureUpdater({
+              id: selectedFlag.id,
+              environmentId: currentEnvironment.id,
+              enabled: !selectedFlag.enabled,
+              comment,
+              resetSamplingSeed: resetSampling
+            });
           }
           if (resp) {
             notify({
-              message: t('message:collection-action-success', {
-                collection: t('source-type.feature-flag'),
-                action: t('updated')
-              })
+              message: (
+                <Trans
+                  i18nKey={
+                    isSchedule
+                      ? 'form:feature-flags.schedule-configured'
+                      : 'form:feature-flags.flag-switch'
+                  }
+                  values={{
+                    name: selectedFlag.name,
+                    state: selectedFlag.enabled
+                      ? t('form:disabled')
+                      : t('form:enabled')
+                  }}
+                />
+              )
             });
             invalidateFeatures(queryClient);
+            invalidateFeature(queryClient);
             onCloseConfirmRequiredModal();
           }
         }
