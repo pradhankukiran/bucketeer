@@ -623,6 +623,7 @@ func (s *server) Run(ctx context.Context, metrics metrics.Metrics, logger *zap.L
 		rpc.WithService(healthChecker),
 		rpc.WithHandler("/health", healthChecker), // Liveness probe
 		rpc.WithHandler("/ready", healthChecker),  // Readiness probe
+		rpc.WithTimeouts(30*time.Second, time.Hour, 60*time.Second),
 	)
 	go server.Run()
 
