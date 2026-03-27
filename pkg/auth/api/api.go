@@ -283,12 +283,16 @@ func (s *authService) RefreshToken(
 	if err := validateRefreshTokenRequest(req); err != nil {
 		s.logger.Error("Failed to validate refresh token request",
 			zap.Error(err),
+			zap.String("refresh_token", obfuscateString(req.RefreshToken, obfuscateTokenLength)),
 		)
 		return nil, err
 	}
 	refreshToken, err := s.verifier.VerifyRefreshToken(req.RefreshToken)
 	if err != nil {
-		s.logger.Error("Refresh token is invalid")
+		s.logger.Error("Refresh token is invalid",
+			zap.Error(err),
+			zap.String("refresh_token", obfuscateString(req.RefreshToken, obfuscateTokenLength)),
+		)
 		return nil, statusUnauthenticated.Err()
 	}
 	organizations, err := s.getOrganizationsByEmail(ctx, refreshToken.Email)
@@ -296,6 +300,7 @@ func (s *authService) RefreshToken(
 		s.logger.Error("Failed to get organizations by email",
 			zap.Error(err),
 			zap.String("email", refreshToken.Email),
+			zap.String("refresh_token", obfuscateString(req.RefreshToken, obfuscateTokenLength)),
 		)
 		return nil, err
 	}
@@ -837,4 +842,13 @@ func (s *authService) PrepareDemoUser() {
 		}
 	}
 	s.logger.Info("Demo environment prepared successfully")
+}
+
+const obfuscateTokenLength = 4
+
+func obfuscateString(input string, showLength int) string {
+	if len(input) > showLength*2 {
+		return input[:showLength] + "...." + input[len(input)-showLength:]
+	}
+	return input
 }
