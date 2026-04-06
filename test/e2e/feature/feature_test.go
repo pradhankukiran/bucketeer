@@ -633,6 +633,100 @@ func TestListFeaturesFilterHasFeatureFlagAsRule(t *testing.T) {
 	}
 }
 
+func TestListFeaturesFilterHasAutoOps(t *testing.T) {
+	t.Parallel()
+	client := newFeatureClient(t)
+	aoClient := newAutoOpsClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Create features
+	featureWithAutoOps := newFeatureID(t)
+	featureWithoutAutoOps := newFeatureID(t)
+	createFeature(t, client, newCreateFeatureReq(featureWithAutoOps))
+	createFeature(t, client, newCreateFeatureReq(featureWithoutAutoOps))
+
+	// Attach a schedule auto ops rule to one feature
+	createAutoOpsRule(
+		ctx,
+		t,
+		aoClient,
+		featureWithAutoOps,
+		aoproto.OpsType_SCHEDULE,
+		nil,
+		[]*aoproto.DatetimeClause{
+			{
+				Time:       time.Now().Add(24 * time.Hour).Unix(),
+				ActionType: aoproto.ActionType_DISABLE,
+			},
+		},
+	)
+
+	// Filter: has_auto_ops = true
+	trueResp, err := client.ListFeatures(ctx, &feature.ListFeaturesRequest{
+		EnvironmentId: *environmentID,
+		HasAutoOps:    &wrappers.BoolValue{Value: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWithAutoOps := false
+	for _, f := range trueResp.Features {
+		if f.Id == featureWithAutoOps {
+			foundWithAutoOps = true
+		}
+		if f.Id == featureWithoutAutoOps {
+			t.Errorf("Feature %s should not appear when filtering has_auto_ops=true", featureWithoutAutoOps)
+		}
+	}
+	if !foundWithAutoOps {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true", featureWithAutoOps)
+	}
+
+	// Filter: has_auto_ops = false
+	falseResp, err := client.ListFeatures(ctx, &feature.ListFeaturesRequest{
+		EnvironmentId: *environmentID,
+		HasAutoOps:    &wrappers.BoolValue{Value: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWithoutAutoOps := false
+	for _, f := range falseResp.Features {
+		if f.Id == featureWithAutoOps {
+			t.Errorf("Feature %s should not appear when filtering has_auto_ops=false", featureWithAutoOps)
+		}
+		if f.Id == featureWithoutAutoOps {
+			foundWithoutAutoOps = true
+		}
+	}
+	if !foundWithoutAutoOps {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=false", featureWithoutAutoOps)
+	}
+
+	// Filter: has_auto_ops = true combined with has_experiment (exercises listFeaturesFilteredByExperiment path)
+	experimentResp, err := client.ListFeatures(ctx, &feature.ListFeaturesRequest{
+		EnvironmentId: *environmentID,
+		HasAutoOps:    &wrappers.BoolValue{Value: true},
+		HasExperiment: &wrappers.BoolValue{Value: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWithAutoOpsInExpPath := false
+	for _, f := range experimentResp.Features {
+		if f.Id == featureWithAutoOps {
+			foundWithAutoOpsInExpPath = true
+		}
+		if f.Id == featureWithoutAutoOps {
+			t.Errorf("Feature %s should not appear when filtering has_auto_ops=true with has_experiment=false", featureWithoutAutoOps)
+		}
+	}
+	if !foundWithAutoOpsInExpPath {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true with has_experiment=false", featureWithAutoOps)
+	}
+}
+
 func TestListFeaturesFilterStatus(t *testing.T) {
 	t.Parallel()
 	client := newFeatureClient(t)

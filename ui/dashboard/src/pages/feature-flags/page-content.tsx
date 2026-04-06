@@ -41,6 +41,10 @@ const PageContent = ({
   const [openFilterModal, onOpenFilterModal, onCloseFilterModal] =
     useToggleOpen(false);
 
+  // NOTE: searchOptions values are strings from URL query params.
+  // Boolean filters (hasExperiment, hasPrerequisites, hasFeatureFlagAsRule,
+  // hasAutoOps, enabled) are not coerced — "false" is truthy in JS, so a
+  // filter set to "No" reloads as "Yes" from a bookmarked/shared URL.
   const searchFilters: Partial<FlagFilters> = searchOptions;
 
   const defaultFilters = {
@@ -61,7 +65,8 @@ const PageContent = ({
       'enabled',
       'tags',
       'status',
-      'hasFeatureFlagAsRule'
+      'hasFeatureFlagAsRule',
+      'hasAutoOps'
     ];
     const count = filterKeys.reduce((acc, curr) => {
       if (isNotEmpty(filters[curr as keyof FlagFilters])) ++acc;
@@ -98,7 +103,8 @@ const PageContent = ({
       tags: undefined,
       tab: 'ACTIVE',
       status: undefined,
-      hasFeatureFlagAsRule: undefined
+      hasFeatureFlagAsRule: undefined,
+      hasAutoOps: undefined
     });
     onCloseFilterModal();
   }, [filters]);
@@ -129,7 +135,10 @@ const PageContent = ({
         enabled: undefined,
         archived: undefined,
         tags: undefined,
-        tab: 'ACTIVE'
+        tab: 'ACTIVE',
+        status: undefined,
+        hasFeatureFlagAsRule: undefined,
+        hasAutoOps: undefined
       });
     }
   }, [location]);

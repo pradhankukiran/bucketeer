@@ -261,6 +261,7 @@ func (s *FeatureService) ListFeatures(
 			req.Archived,
 			req.HasPrerequisites,
 			req.HasFeatureFlagAsRule,
+			req.HasAutoOps,
 			req.SearchKeyword,
 			req.Status,
 			req.OrderBy,
@@ -278,6 +279,7 @@ func (s *FeatureService) ListFeatures(
 			req.Archived,
 			req.HasPrerequisites,
 			req.HasFeatureFlagAsRule,
+			req.HasAutoOps,
 			req.SearchKeyword,
 			req.Status,
 			req.OrderBy,
@@ -357,6 +359,7 @@ func (s *FeatureService) listFeatures(
 	archived *wrappers.BoolValue,
 	hasPrerequisites *wrappers.BoolValue,
 	hasFeatureFlagAsRule *wrappers.BoolValue,
+	hasAutoOps *wrappers.BoolValue,
 	searchKeyword string,
 	status featureproto.FeatureLastUsedInfo_Status,
 	orderBy featureproto.ListFeaturesRequest_OrderBy,
@@ -467,6 +470,16 @@ func (s *FeatureService) listFeatures(
 			Value:    time.Now().Add(-activeDays).Unix(),
 		})
 	}
+	var existsFilters []*mysql.ExistsFilter
+	if hasAutoOps != nil {
+		existsFilters = append(existsFilters, &mysql.ExistsFilter{
+			Subquery: "SELECT 1 FROM auto_ops_rule " +
+				"WHERE feature_id = feature.id " +
+				"AND environment_id = feature.environment_id " +
+				"AND deleted = 0",
+			NotExists: !hasAutoOps.Value,
+		})
+	}
 	orders, err := s.newListFeaturesOrdersMySQL(orderBy, orderDirection)
 	if err != nil {
 		s.logger.Error(
@@ -487,14 +500,15 @@ func (s *FeatureService) listFeatures(
 		return nil, "", 0, statusInvalidCursor.Err()
 	}
 	options := &mysql.ListOptions{
-		Filters:     filters,
-		Orders:      orders,
-		JSONFilters: jsonFilters,
-		NullFilters: nullFilters,
-		InFilters:   nil,
-		SearchQuery: searchQuery,
-		Limit:       limit,
-		Offset:      offset,
+		Filters:       filters,
+		Orders:        orders,
+		JSONFilters:   jsonFilters,
+		NullFilters:   nullFilters,
+		ExistsFilters: existsFilters,
+		InFilters:     nil,
+		SearchQuery:   searchQuery,
+		Limit:         limit,
+		Offset:        offset,
 	}
 	features, nextCursor, totalCount, err := s.featureStorage.ListFeatures(ctx, options)
 	if err != nil {
@@ -520,6 +534,7 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 	archived *wrappers.BoolValue,
 	hasPrerequisites *wrappers.BoolValue,
 	hasFeatureFlagAsRule *wrappers.BoolValue,
+	hasAutoOps *wrappers.BoolValue,
 	searchKeyword string,
 	status featureproto.FeatureLastUsedInfo_Status,
 	orderBy featureproto.ListFeaturesRequest_OrderBy,
@@ -636,6 +651,16 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 			Value:    time.Now().Add(-activeDays).Unix(),
 		})
 	}
+	var existsFilters []*mysql.ExistsFilter
+	if hasAutoOps != nil {
+		existsFilters = append(existsFilters, &mysql.ExistsFilter{
+			Subquery: "SELECT 1 FROM auto_ops_rule " +
+				"WHERE feature_id = feature.id " +
+				"AND environment_id = feature.environment_id " +
+				"AND deleted = 0",
+			NotExists: !hasAutoOps.Value,
+		})
+	}
 	orders, err := s.newListFeaturesOrdersMySQL(orderBy, orderDirection)
 	if err != nil {
 		s.logger.Error(
@@ -657,14 +682,15 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 	}
 	featureStorage := v2fs.NewFeatureStorage(s.mysqlClient)
 	options := &mysql.ListOptions{
-		Filters:     filters,
-		Orders:      orders,
-		JSONFilters: jsonFilters,
-		NullFilters: nullFilters,
-		InFilters:   nil,
-		SearchQuery: searchQuery,
-		Limit:       limit,
-		Offset:      offset,
+		Filters:       filters,
+		Orders:        orders,
+		JSONFilters:   jsonFilters,
+		NullFilters:   nullFilters,
+		ExistsFilters: existsFilters,
+		InFilters:     nil,
+		SearchQuery:   searchQuery,
+		Limit:         limit,
+		Offset:        offset,
 	}
 	features, nextCursor, totalCount, err := featureStorage.ListFeaturesFilteredByExperiment(ctx, options)
 	if err != nil {
@@ -1429,6 +1455,7 @@ func (s *FeatureService) getFeatures(
 		"",
 		nil,
 		"",
+		nil,
 		nil,
 		nil,
 		nil,
