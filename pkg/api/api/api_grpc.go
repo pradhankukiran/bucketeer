@@ -32,7 +32,7 @@ import (
 
 	evaluation "github.com/bucketeer-io/bucketeer/v2/evaluation/go"
 	accountclient "github.com/bucketeer-io/bucketeer/v2/pkg/account/client"
-	accountstotage "github.com/bucketeer-io/bucketeer/v2/pkg/account/storage/v2"
+	accstorage "github.com/bucketeer-io/bucketeer/v2/pkg/account/storage/v2"
 	auditlogclient "github.com/bucketeer-io/bucketeer/v2/pkg/auditlog/client"
 	autoopsclient "github.com/bucketeer-io/bucketeer/v2/pkg/autoops/client"
 	"github.com/bucketeer-io/bucketeer/v2/pkg/cache"
@@ -105,7 +105,7 @@ type options struct {
 }
 
 var defaultOptions = options{
-	apiKeyMemoryCacheTTL:              5 * time.Minute,
+	apiKeyMemoryCacheTTL:              1 * time.Minute,
 	apiKeyMemoryCacheEvictionInterval: 30 * time.Second,
 	pubsubTimeout:                     20 * time.Second,
 	// 31 days - aligns with 30-day DB retention + 1 day buffer
@@ -154,30 +154,31 @@ func WithLogger(l *zap.Logger) Option {
 }
 
 type grpcGatewayService struct {
-	featureClient            featureclient.Client
-	accountClient            accountclient.Client
-	pushClient               pushclient.Client
-	codeRefClient            coderefclient.Client
-	auditLogClient           auditlogclient.Client
-	autoOpsClient            autoopsclient.Client
-	tagClient                tagclient.Client
-	teamClient               teamclient.Client
-	notificationClient       notificationclient.Client
-	experimentClient         experimentclient.Client
-	eventCounterClient       eventcounterclient.Client
-	environmentClient        environmentclient.Client
-	mysqlClient              mysql.Client
-	accountStorage           accountstotage.AccountStorage
-	goalPublisher            publisher.Publisher
-	evaluationPublisher      publisher.Publisher
-	userPublisher            publisher.Publisher
-	featuresCache            cachev3.FeaturesCache
-	segmentUsersCache        cachev3.SegmentUsersCache
-	environmentAPIKeyCache   cachev3.EnvironmentAPIKeyCache
-	apiKeyLastUsedInfoCacher sync.Map
-	flightgroup              singleflight.Group
-	opts                     *options
-	logger                   *zap.Logger
+	featureClient               featureclient.Client
+	accountClient               accountclient.Client
+	pushClient                  pushclient.Client
+	codeRefClient               coderefclient.Client
+	auditLogClient              auditlogclient.Client
+	autoOpsClient               autoopsclient.Client
+	tagClient                   tagclient.Client
+	teamClient                  teamclient.Client
+	notificationClient          notificationclient.Client
+	experimentClient            experimentclient.Client
+	eventCounterClient          eventcounterclient.Client
+	environmentClient           environmentclient.Client
+	mysqlClient                 mysql.Client
+	accountStorage              accstorage.AccountStorage
+	goalPublisher               publisher.Publisher
+	evaluationPublisher         publisher.Publisher
+	userPublisher               publisher.Publisher
+	featuresCache               cachev3.FeaturesCache
+	segmentUsersCache           cachev3.SegmentUsersCache
+	environmentAPIKeyCache      cachev3.EnvironmentAPIKeyCache
+	environmentAPIKeyRedisCache cachev3.EnvironmentAPIKeyCache
+	apiKeyLastUsedInfoCacher    sync.Map
+	flightgroup                 singleflight.Group
+	opts                        *options
+	logger                      *zap.Logger
 }
 
 func NewGrpcGatewayService(
@@ -208,30 +209,34 @@ func NewGrpcGatewayService(
 	if options.metrics != nil {
 		registerMetrics(options.metrics)
 	}
+	inMemoryCache := cachev3.NewInMemoryCache(
+		cachev3.WithEvictionInterval(options.apiKeyMemoryCacheEvictionInterval),
+	)
 	s := &grpcGatewayService{
-		featureClient:            featureClient,
-		accountClient:            accountClient,
-		pushClient:               pushClient,
-		codeRefClient:            codeRefClient,
-		auditLogClient:           auditLogClient,
-		autoOpsClient:            autoOpsClient,
-		tagClient:                tagClient,
-		teamClient:               teamClient,
-		notificationClient:       notificationClient,
-		experimentClient:         experimentClient,
-		eventCounterClient:       eventCounterClient,
-		environmentClient:        environmentClient,
-		mysqlClient:              mysqlClient,
-		accountStorage:           accountstotage.NewAccountStorage(mysqlClient),
-		goalPublisher:            gp,
-		evaluationPublisher:      ep,
-		userPublisher:            up,
-		featuresCache:            cachev3.NewFeaturesCache(redisV3Cache),
-		segmentUsersCache:        cachev3.NewSegmentUsersCache(redisV3Cache),
-		environmentAPIKeyCache:   cachev3.NewEnvironmentAPIKeyCache(redisV3Cache),
-		apiKeyLastUsedInfoCacher: sync.Map{},
-		opts:                     &options,
-		logger:                   options.logger.Named("api_grpc"),
+		featureClient:               featureClient,
+		accountClient:               accountClient,
+		pushClient:                  pushClient,
+		codeRefClient:               codeRefClient,
+		auditLogClient:              auditLogClient,
+		autoOpsClient:               autoOpsClient,
+		tagClient:                   tagClient,
+		teamClient:                  teamClient,
+		notificationClient:          notificationClient,
+		experimentClient:            experimentClient,
+		eventCounterClient:          eventCounterClient,
+		environmentClient:           environmentClient,
+		mysqlClient:                 mysqlClient,
+		accountStorage:              accstorage.NewAccountStorage(mysqlClient),
+		goalPublisher:               gp,
+		evaluationPublisher:         ep,
+		userPublisher:               up,
+		featuresCache:               cachev3.NewFeaturesCache(redisV3Cache),
+		segmentUsersCache:           cachev3.NewSegmentUsersCache(redisV3Cache),
+		environmentAPIKeyCache:      cachev3.NewEnvironmentAPIKeyCache(inMemoryCache, options.apiKeyMemoryCacheTTL),
+		environmentAPIKeyRedisCache: cachev3.NewEnvironmentAPIKeyCache(redisV3Cache, 0),
+		apiKeyLastUsedInfoCacher:    sync.Map{},
+		opts:                        &options,
+		logger:                      options.logger.Named("api_grpc"),
 	}
 
 	go s.writeAPIKeyLastUsedAtCacheToDatabase(ctx)
@@ -1585,35 +1590,60 @@ func (s *grpcGatewayService) getEnvironmentAPIKey(
 	k, err, _ := s.flightgroup.Do(
 		environmentAPIKeyFlightID(apiKey),
 		func() (interface{}, error) {
+			// L1: in-memory cache
 			envAPIKey, err := getEnvironmentAPIKeyFromCache(
-				ctx,
 				apiKey,
 				s.environmentAPIKeyCache,
 				callerGatewayService,
 				cacheLayerInMemory,
 			)
-			// Cache found
 			if err == nil {
 				return envAPIKey, nil
 			}
+			// L2: Redis cache (kept warm by batch cacher)
+			envAPIKey, err = getEnvironmentAPIKeyFromCache(
+				apiKey,
+				s.environmentAPIKeyRedisCache,
+				callerGatewayService,
+				cacheLayerExternal,
+			)
+			if err == nil {
+				putEnvironmentAPIKeyCache(
+					ctx,
+					envAPIKey,
+					s.environmentAPIKeyCache,
+					s.logger,
+				)
+				return envAPIKey, nil
+			}
+			// L3: direct DB query
 			s.logger.Warn(
-				"API key not found in the cache",
+				"API key not found in cache",
 				log.FieldsFromIncomingContext(ctx).AddFields(
 					zap.Error(err),
 					zap.String("apiKey", obfuscateString(apiKey, obfuscateAPIKeyLength)),
 				)...,
 			)
-			// No cache
-			envAPIKey, err = getEnvironmentAPIKey(
+			// Since the Get and List APIs for the API keys are obsfucated,
+			// we need to directly query the database.
+			domainEnvAPIKey, err := s.accountStorage.GetEnvironmentAPIKey(ctx, apiKey)
+			if err != nil {
+				if errors.Is(err, accstorage.ErrAPIKeyNotFound) {
+					return nil, ErrInvalidAPIKey
+				}
+				s.logger.Error(
+					"Failed to get environment APIKey from storage",
+					log.FieldsFromIncomingContext(ctx).AddFields(zap.Error(err))...,
+				)
+				return nil, ErrInternal
+			}
+			envAPIKey = domainEnvAPIKey.EnvironmentAPIKey
+			putEnvironmentAPIKeyCache(
 				ctx,
-				apiKey,
-				s.accountClient,
+				envAPIKey,
 				s.environmentAPIKeyCache,
 				s.logger,
 			)
-			if err != nil {
-				return nil, err
-			}
 			return envAPIKey, nil
 		},
 	)
@@ -1640,32 +1670,7 @@ func environmentAPIKeyFlightID(id string) string {
 	return id
 }
 
-func getEnvironmentAPIKey(
-	ctx context.Context,
-	apiKey string,
-	accountClient accountclient.Client,
-	environmentAPIKeyCache cachev3.EnvironmentAPIKeyCache,
-	logger *zap.Logger,
-) (*accountproto.EnvironmentAPIKey, error) {
-	resp, err := accountClient.GetEnvironmentAPIKey(
-		ctx,
-		&accountproto.GetEnvironmentAPIKeyRequest{ApiKey: apiKey},
-	)
-	if err != nil {
-		if code := status.Code(err); code == codes.NotFound {
-			return nil, ErrInvalidAPIKey
-		}
-		logger.Error(
-			"Failed to get environment APIKey from account service",
-			log.FieldsFromIncomingContext(ctx).AddFields(zap.Error(err))...,
-		)
-		return nil, ErrInternal
-	}
-	return resp.EnvironmentApiKey, nil
-}
-
 func getEnvironmentAPIKeyFromCache(
-	ctx context.Context,
 	apikey string,
 	c cachev3.EnvironmentAPIKeyCache,
 	caller, layer string,
@@ -1677,6 +1682,23 @@ func getEnvironmentAPIKeyFromCache(
 	}
 	cacheCounter.WithLabelValues(caller, typeAPIKey, layer, codeMiss).Inc()
 	return nil, err
+}
+
+func putEnvironmentAPIKeyCache(
+	ctx context.Context,
+	envAPIKey *accountproto.EnvironmentAPIKey,
+	environmentAPIKeyCache cachev3.EnvironmentAPIKeyCache,
+	logger *zap.Logger,
+) {
+	if err := environmentAPIKeyCache.Put(envAPIKey); err != nil {
+		logger.Error(
+			"Failed to cache environment APIKey",
+			log.FieldsFromIncomingContext(ctx).AddFields(
+				zap.Error(err),
+				zap.String("environmentNamespace", envAPIKey.Environment.Id),
+			)...,
+		)
+	}
 }
 
 func checkEnvironmentAPIKey(

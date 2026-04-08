@@ -27,12 +27,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 
 	evaluation "github.com/bucketeer-io/bucketeer/v2/evaluation/go"
 	accountclientmock "github.com/bucketeer-io/bucketeer/v2/pkg/account/client/mock"
+	accountdomain "github.com/bucketeer-io/bucketeer/v2/pkg/account/domain"
+	accstorage "github.com/bucketeer-io/bucketeer/v2/pkg/account/storage/v2"
+	accountstoragemock "github.com/bucketeer-io/bucketeer/v2/pkg/account/storage/v2/mock"
 	auditlogclientmock "github.com/bucketeer-io/bucketeer/v2/pkg/auditlog/client/mock"
 	autoopsclientmock "github.com/bucketeer-io/bucketeer/v2/pkg/autoops/client/mock"
 	"github.com/bucketeer-io/bucketeer/v2/pkg/cache"
@@ -183,12 +184,35 @@ func TestGrpcGetEnvironmentAPIKey(t *testing.T) {
 			expectedErr: nil,
 		},
 		{
+			desc: "exists in Redis cache",
+			setup: func(gs *grpcGatewayService) {
+				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
+					nil, cache.ErrNotFound)
+				gs.environmentAPIKeyRedisCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
+					&accountproto.EnvironmentAPIKey{
+						Environment: &environmentproto.EnvironmentV2{Id: "ns0"},
+						ApiKey:      &accountproto.APIKey{Id: "id-0"},
+					}, nil)
+				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Put(gomock.Any()).Return(nil)
+			},
+			ctx: metadata.NewIncomingContext(context.TODO(), metadata.MD{
+				"authorization": []string{"test-key"},
+			}),
+			expected: &accountproto.EnvironmentAPIKey{
+				Environment: &environmentproto.EnvironmentV2{Id: "ns0"},
+				ApiKey:      &accountproto.APIKey{Id: "id-0"},
+			},
+			expectedErr: nil,
+		},
+		{
 			desc: "ErrInvalidAPIKey",
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
 					nil, cache.ErrNotFound)
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					nil, status.Errorf(codes.NotFound, "test"))
+				gs.environmentAPIKeyRedisCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
+					nil, cache.ErrNotFound)
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					nil, accstorage.ErrAPIKeyNotFound)
 			},
 			ctx: metadata.NewIncomingContext(context.TODO(), metadata.MD{
 				"authorization": []string{"test-key"},
@@ -201,8 +225,10 @@ func TestGrpcGetEnvironmentAPIKey(t *testing.T) {
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
 					nil, cache.ErrNotFound)
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					nil, status.Errorf(codes.Unknown, "test"))
+				gs.environmentAPIKeyRedisCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
+					nil, cache.ErrNotFound)
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					nil, errors.New("db error"))
 			},
 			ctx: metadata.NewIncomingContext(context.TODO(), metadata.MD{
 				"authorization": []string{"test-key"},
@@ -211,15 +237,18 @@ func TestGrpcGetEnvironmentAPIKey(t *testing.T) {
 			expectedErr: ErrInternal,
 		},
 		{
-			desc: "success",
+			desc: "success from DB",
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
 					nil, cache.ErrNotFound)
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					&accountproto.GetEnvironmentAPIKeyResponse{EnvironmentApiKey: &accountproto.EnvironmentAPIKey{
+				gs.environmentAPIKeyRedisCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
+					nil, cache.ErrNotFound)
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					&accountdomain.EnvironmentAPIKey{EnvironmentAPIKey: &accountproto.EnvironmentAPIKey{
 						Environment: &environmentproto.EnvironmentV2{Id: "ns0"},
 						ApiKey:      &accountproto.APIKey{Id: "id-0"},
 					}}, nil)
+				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Put(gomock.Any()).Return(nil)
 			},
 			ctx: metadata.NewIncomingContext(context.TODO(), metadata.MD{
 				"authorization": []string{"test-key"},
@@ -233,6 +262,8 @@ func TestGrpcGetEnvironmentAPIKey(t *testing.T) {
 	}
 	for _, p := range patterns {
 		gs := newGrpcGatewayServiceWithMock(t, mockController)
+		redisMock := cachev3mock.NewMockEnvironmentAPIKeyCache(mockController)
+		gs.environmentAPIKeyRedisCache = redisMock
 		p.setup(gs)
 		id, err := gs.extractAPIKey(p.ctx)
 		assert.NoError(t, err)
@@ -273,7 +304,7 @@ func TestGrpcGetEnvironmentAPIKeyFromCache(t *testing.T) {
 	for _, p := range patterns {
 		mock := cachev3mock.NewMockEnvironmentAPIKeyCache(mockController)
 		p.setup(mock)
-		actual, err := getEnvironmentAPIKeyFromCache(context.Background(), "id", mock, "caller", "layer")
+		actual, err := getEnvironmentAPIKeyFromCache("id", mock, "caller", "layer")
 		assert.Equal(t, p.expected, actual, "%s", p.desc)
 		assert.Equal(t, p.expectedErr, err, "%s", p.desc)
 	}
@@ -708,8 +739,8 @@ func TestGrpcTrack(t *testing.T) {
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(gomock.Any()).Return(
 					nil, cache.ErrNotFound)
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					nil, status.Errorf(codes.NotFound, "error: apy key not found"))
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					nil, accstorage.ErrAPIKeyNotFound)
 			},
 			input: &gwproto.TrackRequest{
 				Apikey:    "api-key",
@@ -966,8 +997,8 @@ func TestGrpcGetSegmentUsers(t *testing.T) {
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(apiKey).Return(
 					nil, errors.New("internal error"))
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					nil, status.Errorf(codes.NotFound, "test"))
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					nil, accstorage.ErrAPIKeyNotFound)
 			},
 			input:       &gwproto.GetSegmentUsersRequest{},
 			expected:    nil,
@@ -1532,8 +1563,8 @@ func TestGrpcGetFeatureFlags(t *testing.T) {
 			setup: func(gs *grpcGatewayService) {
 				gs.environmentAPIKeyCache.(*cachev3mock.MockEnvironmentAPIKeyCache).EXPECT().Get(apiKey).Return(
 					nil, errors.New("internal error"))
-				gs.accountClient.(*accountclientmock.MockClient).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
-					nil, status.Errorf(codes.NotFound, "test"))
+				gs.accountStorage.(*accountstoragemock.MockAccountStorage).EXPECT().GetEnvironmentAPIKey(gomock.Any(), gomock.Any()).Return(
+					nil, accstorage.ErrAPIKeyNotFound)
 			},
 			input:       &gwproto.GetFeatureFlagsRequest{Tag: "test", FeatureFlagsId: ""},
 			expected:    nil,
@@ -4250,28 +4281,32 @@ func TestGrpcContainsInvalidTimestampError(t *testing.T) {
 func newGrpcGatewayServiceWithMock(t *testing.T, mockController *gomock.Controller) *grpcGatewayService {
 	logger, err := log.NewLogger()
 	require.NoError(t, err)
+	redisAPIKeyCache := cachev3mock.NewMockEnvironmentAPIKeyCache(mockController)
+	redisAPIKeyCache.EXPECT().Get(gomock.Any()).Return(nil, cache.ErrNotFound).AnyTimes()
 	return &grpcGatewayService{
-		featureClient:            featureclientmock.NewMockClient(mockController),
-		accountClient:            accountclientmock.NewMockClient(mockController),
-		pushClient:               pushclientmock.NewMockClient(mockController),
-		codeRefClient:            coderefclientmock.NewMockClient(mockController),
-		auditLogClient:           auditlogclientmock.NewMockClient(mockController),
-		autoOpsClient:            autoopsclientmock.NewMockClient(mockController),
-		goalPublisher:            publishermock.NewMockPublisher(mockController),
-		tagClient:                tagclientmock.NewMockClient(mockController),
-		teamClient:               teamclientmock.NewMockClient(mockController),
-		notificationClient:       notificationclientmock.NewMockClient(mockController),
-		experimentClient:         experimentclientmock.NewMockClient(mockController),
-		eventCounterClient:       eventcounterclientmock.NewMockClient(mockController),
-		environmentClient:        environmentclientmock.NewMockClient(mockController),
-		userPublisher:            publishermock.NewMockPublisher(mockController),
-		evaluationPublisher:      publishermock.NewMockPublisher(mockController),
-		featuresCache:            cachev3mock.NewMockFeaturesCache(mockController),
-		segmentUsersCache:        cachev3mock.NewMockSegmentUsersCache(mockController),
-		environmentAPIKeyCache:   cachev3mock.NewMockEnvironmentAPIKeyCache(mockController),
-		apiKeyLastUsedInfoCacher: sync.Map{},
-		opts:                     &defaultOptions,
-		logger:                   logger,
+		featureClient:               featureclientmock.NewMockClient(mockController),
+		accountClient:               accountclientmock.NewMockClient(mockController),
+		accountStorage:              accountstoragemock.NewMockAccountStorage(mockController),
+		pushClient:                  pushclientmock.NewMockClient(mockController),
+		codeRefClient:               coderefclientmock.NewMockClient(mockController),
+		auditLogClient:              auditlogclientmock.NewMockClient(mockController),
+		autoOpsClient:               autoopsclientmock.NewMockClient(mockController),
+		goalPublisher:               publishermock.NewMockPublisher(mockController),
+		tagClient:                   tagclientmock.NewMockClient(mockController),
+		teamClient:                  teamclientmock.NewMockClient(mockController),
+		notificationClient:          notificationclientmock.NewMockClient(mockController),
+		experimentClient:            experimentclientmock.NewMockClient(mockController),
+		eventCounterClient:          eventcounterclientmock.NewMockClient(mockController),
+		environmentClient:           environmentclientmock.NewMockClient(mockController),
+		userPublisher:               publishermock.NewMockPublisher(mockController),
+		evaluationPublisher:         publishermock.NewMockPublisher(mockController),
+		featuresCache:               cachev3mock.NewMockFeaturesCache(mockController),
+		segmentUsersCache:           cachev3mock.NewMockSegmentUsersCache(mockController),
+		environmentAPIKeyCache:      cachev3mock.NewMockEnvironmentAPIKeyCache(mockController),
+		environmentAPIKeyRedisCache: redisAPIKeyCache,
+		apiKeyLastUsedInfoCacher:    sync.Map{},
+		opts:                        &defaultOptions,
+		logger:                      logger,
 	}
 }
 
