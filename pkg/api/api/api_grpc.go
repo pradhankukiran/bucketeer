@@ -96,9 +96,12 @@ var (
 type options struct {
 	apiKeyMemoryCacheTTL              time.Duration
 	apiKeyMemoryCacheEvictionInterval time.Duration
+	featuresMemoryCacheTTL            time.Duration
+	segmentUsersMemoryCacheTTL        time.Duration
 	pubsubTimeout                     time.Duration
 	oldestEventTimestamp              time.Duration
 	furthestEventTimestamp            time.Duration
+	inMemoryCache                     *cachev3.InMemoryCache
 	metrics                           metrics.Registerer
 	logger                            *zap.Logger
 }
@@ -106,6 +109,8 @@ type options struct {
 var defaultOptions = options{
 	apiKeyMemoryCacheTTL:              1 * time.Minute,
 	apiKeyMemoryCacheEvictionInterval: 30 * time.Second,
+	featuresMemoryCacheTTL:            1 * time.Minute,
+	segmentUsersMemoryCacheTTL:        1 * time.Minute,
 	pubsubTimeout:                     20 * time.Second,
 	// 31 days - aligns with 30-day DB retention + 1 day buffer
 	oldestEventTimestamp: 744 * time.Hour,
@@ -140,6 +145,24 @@ func WithAPIKeyMemoryCacheEvictionInterval(interval time.Duration) Option {
 	}
 }
 
+func WithFeaturesMemoryCacheTTL(ttl time.Duration) Option {
+	return func(opts *options) {
+		opts.featuresMemoryCacheTTL = ttl
+	}
+}
+
+func WithSegmentUsersMemoryCacheTTL(ttl time.Duration) Option {
+	return func(opts *options) {
+		opts.segmentUsersMemoryCacheTTL = ttl
+	}
+}
+
+func WithInMemoryCache(c *cachev3.InMemoryCache) Option {
+	return func(opts *options) {
+		opts.inMemoryCache = c
+	}
+}
+
 func WithMetrics(r metrics.Registerer) Option {
 	return func(opts *options) {
 		opts.metrics = r
@@ -171,7 +194,9 @@ type grpcGatewayService struct {
 	evaluationPublisher         publisher.Publisher
 	userPublisher               publisher.Publisher
 	featuresCache               cachev3.FeaturesCache
+	featuresRedisCache          cachev3.FeaturesCache
 	segmentUsersCache           cachev3.SegmentUsersCache
+	segmentUsersRedisCache      cachev3.SegmentUsersCache
 	environmentAPIKeyCache      cachev3.EnvironmentAPIKeyCache
 	environmentAPIKeyRedisCache cachev3.EnvironmentAPIKeyCache
 	apiKeyLastUsedInfoCacher    sync.Map
@@ -208,9 +233,12 @@ func NewGrpcGatewayService(
 	if options.metrics != nil {
 		registerMetrics(options.metrics)
 	}
-	inMemoryCache := cachev3.NewInMemoryCache(
-		cachev3.WithEvictionInterval(options.apiKeyMemoryCacheEvictionInterval),
-	)
+	inMemoryCache := options.inMemoryCache
+	if inMemoryCache == nil {
+		inMemoryCache = cachev3.NewInMemoryCache(
+			cachev3.WithEvictionInterval(options.apiKeyMemoryCacheEvictionInterval),
+		)
+	}
 	s := &grpcGatewayService{
 		featureClient:               featureClient,
 		accountClient:               accountClient,
@@ -229,8 +257,10 @@ func NewGrpcGatewayService(
 		goalPublisher:               gp,
 		evaluationPublisher:         ep,
 		userPublisher:               up,
-		featuresCache:               cachev3.NewFeaturesCache(redisV3Cache),
-		segmentUsersCache:           cachev3.NewSegmentUsersCache(redisV3Cache),
+		featuresCache:               cachev3.NewFeaturesCache(inMemoryCache, options.featuresMemoryCacheTTL),
+		featuresRedisCache:          cachev3.NewFeaturesCache(redisV3Cache, 0),
+		segmentUsersCache:           cachev3.NewSegmentUsersCache(inMemoryCache, options.segmentUsersMemoryCacheTTL),
+		segmentUsersRedisCache:      cachev3.NewSegmentUsersCache(redisV3Cache, 0),
 		environmentAPIKeyCache:      cachev3.NewEnvironmentAPIKeyCache(inMemoryCache, options.apiKeyMemoryCacheTTL),
 		environmentAPIKeyRedisCache: cachev3.NewEnvironmentAPIKeyCache(redisV3Cache, 0),
 		apiKeyLastUsedInfoCacher:    sync.Map{},
@@ -1125,10 +1155,28 @@ func (s *grpcGatewayService) getFeatures(
 	ctx context.Context,
 	environmentId string,
 ) ([]*featureproto.Feature, error) {
-	fs, err := s.getFeaturesFromCache(ctx, environmentId)
+	// L1: in-memory cache
+	fs, err := getFeaturesFromCache(
+		environmentId,
+		s.featuresCache,
+		callerGatewayService,
+		cacheLayerInMemory,
+	)
 	if err == nil {
 		return fs.Features, nil
 	}
+	// L2: Redis cache (kept warm by batch cacher)
+	fs, err = getFeaturesFromCache(
+		environmentId,
+		s.featuresRedisCache,
+		callerGatewayService,
+		cacheLayerExternal,
+	)
+	if err == nil {
+		putFeaturesCache(ctx, fs, environmentId, s.featuresCache, s.logger)
+		return fs.Features, nil
+	}
+	// L3: feature service (DB)
 	s.logger.Warn(
 		"No cached data for Features",
 		log.FieldsFromIncomingContext(ctx).AddFields(
@@ -1184,17 +1232,36 @@ func (s *grpcGatewayService) listFeatures(
 	}
 }
 
-func (s *grpcGatewayService) getFeaturesFromCache(
-	ctx context.Context,
+func getFeaturesFromCache(
 	environmentId string,
+	c cachev3.FeaturesCache,
+	caller, layer string,
 ) (*featureproto.Features, error) {
-	features, err := s.featuresCache.Get(environmentId)
+	features, err := c.Get(environmentId)
 	if err == nil {
-		cacheCounter.WithLabelValues(callerGatewayService, typeFeatures, cacheLayerExternal, codeHit).Inc()
+		cacheCounter.WithLabelValues(caller, typeFeatures, layer, codeHit).Inc()
 		return features, nil
 	}
-	cacheCounter.WithLabelValues(callerGatewayService, typeFeatures, cacheLayerExternal, codeMiss).Inc()
+	cacheCounter.WithLabelValues(caller, typeFeatures, layer, codeMiss).Inc()
 	return nil, err
+}
+
+func putFeaturesCache(
+	ctx context.Context,
+	features *featureproto.Features,
+	environmentId string,
+	featuresCache cachev3.FeaturesCache,
+	logger *zap.Logger,
+) {
+	if err := featuresCache.Put(features, environmentId); err != nil {
+		logger.Error(
+			"Failed to cache features",
+			log.FieldsFromIncomingContext(ctx).AddFields(
+				zap.Error(err),
+				zap.String("environmentID", environmentId),
+			)...,
+		)
+	}
 }
 
 func (s *grpcGatewayService) getSegmentUsersMap(
@@ -1253,10 +1320,30 @@ func (s *grpcGatewayService) getSegmentUsersBySegmentID(
 	ctx context.Context,
 	segmentID, environmentId string,
 ) (*featureproto.SegmentUsers, error) {
-	segmentUsers, err := s.getSegmentUsersFromCache(segmentID, environmentId)
+	// L1: in-memory cache
+	segmentUsers, err := getSegmentUsersFromCache(
+		segmentID,
+		environmentId,
+		s.segmentUsersCache,
+		callerGatewayService,
+		cacheLayerInMemory,
+	)
 	if err == nil {
 		return segmentUsers, nil
 	}
+	// L2: Redis cache (kept warm by batch cacher)
+	segmentUsers, err = getSegmentUsersFromCache(
+		segmentID,
+		environmentId,
+		s.segmentUsersRedisCache,
+		callerGatewayService,
+		cacheLayerExternal,
+	)
+	if err == nil {
+		putSegmentUsersCache(ctx, segmentUsers, environmentId, s.segmentUsersCache, s.logger)
+		return segmentUsers, nil
+	}
+	// L3: feature service (DB)
 	s.logger.Warn(
 		"No cached data for SegmentUsers",
 		log.FieldsFromIncomingContext(ctx).AddFields(
@@ -1297,23 +1384,46 @@ func (s *grpcGatewayService) getSegmentUsersBySegmentID(
 		)
 		return nil, ErrInternal
 	}
-	return &featureproto.SegmentUsers{
+	segmentUsers = &featureproto.SegmentUsers{
 		SegmentId: segmentID,
 		Users:     res.Users,
 		UpdatedAt: respGet.Segment.UpdatedAt,
-	}, nil
+	}
+	putSegmentUsersCache(ctx, segmentUsers, environmentId, s.segmentUsersCache, s.logger)
+	return segmentUsers, nil
 }
 
-func (s *grpcGatewayService) getSegmentUsersFromCache(
+func getSegmentUsersFromCache(
 	segmentID, environmentId string,
+	c cachev3.SegmentUsersCache,
+	caller, layer string,
 ) (*featureproto.SegmentUsers, error) {
-	segmentUsers, err := s.segmentUsersCache.Get(segmentID, environmentId)
+	segmentUsers, err := c.Get(segmentID, environmentId)
 	if err == nil {
-		cacheCounter.WithLabelValues(callerGatewayService, typeSegmentUsers, cacheLayerExternal, codeHit).Inc()
+		cacheCounter.WithLabelValues(caller, typeSegmentUsers, layer, codeHit).Inc()
 		return segmentUsers, nil
 	}
-	cacheCounter.WithLabelValues(callerGatewayService, typeSegmentUsers, cacheLayerExternal, codeMiss).Inc()
+	cacheCounter.WithLabelValues(caller, typeSegmentUsers, layer, codeMiss).Inc()
 	return nil, err
+}
+
+func putSegmentUsersCache(
+	ctx context.Context,
+	segmentUsers *featureproto.SegmentUsers,
+	environmentId string,
+	segmentUsersCache cachev3.SegmentUsersCache,
+	logger *zap.Logger,
+) {
+	if err := segmentUsersCache.Put(segmentUsers, environmentId); err != nil {
+		logger.Error(
+			"Failed to cache segment users",
+			log.FieldsFromIncomingContext(ctx).AddFields(
+				zap.Error(err),
+				zap.String("environmentID", environmentId),
+				zap.String("segmentId", segmentUsers.SegmentId),
+			)...,
+		)
+	}
 }
 
 func (s *grpcGatewayService) RegisterEvents(

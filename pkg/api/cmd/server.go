@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	notificationclient "github.com/bucketeer-io/bucketeer/v2/pkg/notification/client"
 	"github.com/bucketeer-io/bucketeer/v2/pkg/pubsub/factory"
 	"github.com/bucketeer-io/bucketeer/v2/pkg/pubsub/publisher"
+	"github.com/bucketeer-io/bucketeer/v2/pkg/pubsub/puller"
 	pushclient "github.com/bucketeer-io/bucketeer/v2/pkg/push/client"
 	redisv3 "github.com/bucketeer-io/bucketeer/v2/pkg/redis/v3"
 	"github.com/bucketeer-io/bucketeer/v2/pkg/rest"
@@ -50,6 +52,7 @@ import (
 	"github.com/bucketeer-io/bucketeer/v2/pkg/storage/v2/mysql"
 	tagclient "github.com/bucketeer-io/bucketeer/v2/pkg/tag/client"
 	teamclient "github.com/bucketeer-io/bucketeer/v2/pkg/team/client"
+	uuid "github.com/bucketeer-io/bucketeer/v2/pkg/uuid"
 	gwproto "github.com/bucketeer-io/bucketeer/v2/proto/gateway"
 )
 
@@ -107,6 +110,8 @@ type server struct {
 	furthestEventTimestamp            *time.Duration
 	apiKeyMemoryCacheTTL              *time.Duration
 	apiKeyMemoryCacheEvictionInterval *time.Duration
+	featuresMemoryCacheTTL            *time.Duration
+	segmentUsersMemoryCacheTTL        *time.Duration
 	// PubSub configurations
 	pubSubType                *string
 	pubSubRedisServerName     *string
@@ -115,6 +120,7 @@ type server struct {
 	pubSubRedisMinIdle        *int
 	pubSubRedisPartitionCount *int
 	pubSubRedisMode           *string
+	domainTopic               *string
 }
 
 func RegisterCommand(r cli.CommandRegistry, p cli.ParentCommand) cli.Command {
@@ -229,6 +235,14 @@ func RegisterCommand(r cli.CommandRegistry, p cli.ParentCommand) cli.Command {
 			"api-key-memory-cache-eviction-interval",
 			"Eviction interval for the in-memory API key cache.",
 		).Default("30s").Duration(),
+		featuresMemoryCacheTTL: cmd.Flag(
+			"features-memory-cache-ttl",
+			"TTL for the in-memory features cache.",
+		).Default("1m").Duration(),
+		segmentUsersMemoryCacheTTL: cmd.Flag(
+			"segment-users-memory-cache-ttl",
+			"TTL for the in-memory segment users cache.",
+		).Default("1m").Duration(),
 		// PubSub configurations
 		pubSubType: cmd.Flag("pubsub-type",
 			"Type of PubSub to use (google or redis-stream).",
@@ -251,6 +265,9 @@ func RegisterCommand(r cli.CommandRegistry, p cli.ParentCommand) cli.Command {
 		pubSubRedisMode: cmd.Flag("pubsub-redis-mode",
 			"PubSub Redis client mode: cluster, standalone, or auto.",
 		).Default("auto").String(),
+		domainTopic: cmd.Flag("domain-topic",
+			"PubSub topic for domain events. Used to invalidate in-memory caches.",
+		).String(),
 	}
 	r.RegisterCommand(server)
 	return server
@@ -489,6 +506,20 @@ func (s *server) Run(ctx context.Context, metrics metrics.Metrics, logger *zap.L
 	}
 	redisV3Cache := cachev3.NewRedisCache(redisV3Client)
 
+	inMemoryCache := cachev3.NewInMemoryCache(
+		cachev3.WithEvictionInterval(*s.apiKeyMemoryCacheEvictionInterval),
+	)
+
+	invalidatorCtx, invalidatorCancel := context.WithCancel(context.Background())
+	defer invalidatorCancel()
+	if *s.domainTopic != "" {
+		if err := s.startCacheInvalidator(
+			invalidatorCtx, pubsubClient, inMemoryCache, logger,
+		); err != nil {
+			return err
+		}
+	}
+
 	mysqlClient, err := s.createMySQLClient(ctx, registerer, logger)
 	if err != nil {
 		return err
@@ -513,8 +544,11 @@ func (s *server) Run(ctx context.Context, metrics metrics.Metrics, logger *zap.L
 		evaluationPublisher,
 		userPublisher,
 		redisV3Cache,
+		api.WithInMemoryCache(inMemoryCache),
 		api.WithAPIKeyMemoryCacheTTL(*s.apiKeyMemoryCacheTTL),
 		api.WithAPIKeyMemoryCacheEvictionInterval(*s.apiKeyMemoryCacheEvictionInterval),
+		api.WithFeaturesMemoryCacheTTL(*s.featuresMemoryCacheTTL),
+		api.WithSegmentUsersMemoryCacheTTL(*s.segmentUsersMemoryCacheTTL),
 		api.WithOldestEventTimestamp(*s.oldestEventTimestamp),
 		api.WithFurthestEventTimestamp(*s.furthestEventTimestamp),
 		api.WithMetrics(registerer),
@@ -590,8 +624,11 @@ func (s *server) Run(ctx context.Context, metrics metrics.Metrics, logger *zap.L
 		metricsPublisher,
 		mysqlClient,
 		redisV3Cache,
+		api.WithInMemoryCache(inMemoryCache),
 		api.WithAPIKeyMemoryCacheTTL(*s.apiKeyMemoryCacheTTL),
 		api.WithAPIKeyMemoryCacheEvictionInterval(*s.apiKeyMemoryCacheEvictionInterval),
+		api.WithFeaturesMemoryCacheTTL(*s.featuresMemoryCacheTTL),
+		api.WithSegmentUsersMemoryCacheTTL(*s.segmentUsersMemoryCacheTTL),
 		api.WithOldestEventTimestamp(*s.oldestEventTimestamp),
 		api.WithFurthestEventTimestamp(*s.furthestEventTimestamp),
 		api.WithMetrics(registerer),
@@ -679,6 +716,58 @@ func (s *server) Run(ctx context.Context, metrics metrics.Metrics, logger *zap.L
 	}()
 
 	<-ctx.Done()
+	return nil
+}
+
+// startCacheInvalidator subscribes to domain events to evict L1 in-memory
+// cache entries when feature flags or segments are updated. Each pod uses a
+// unique consumer group (based on hostname) so every pod receives every event.
+func (s *server) startCacheInvalidator(
+	ctx context.Context,
+	pubsubClient factory.Client,
+	inMemoryCache *cachev3.InMemoryCache,
+	logger *zap.Logger,
+) error {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		id, uuidErr := uuid.NewUUID()
+		if uuidErr != nil {
+			logger.Error("Failed to get hostname and generate UUID", zap.Error(err))
+			return fmt.Errorf("failed to generate unique subscription name: %w", uuidErr)
+		}
+		hostname = id.String()
+		logger.Warn("Failed to get hostname, using generated ID",
+			zap.Error(err),
+			zap.String("generatedId", hostname),
+		)
+	}
+	subscription := fmt.Sprintf("gateway-cache-invalidator-%s", hostname)
+	domainPuller, err := pubsubClient.CreatePuller(subscription, *s.domainTopic)
+	if err != nil {
+		logger.Error("Failed to create domain event puller", zap.Error(err))
+		return err
+	}
+	rateLimitedPuller := puller.NewRateLimitedPuller(domainPuller, 1000)
+	invalidator := api.NewCacheInvalidator(
+		cachev3.NewFeaturesCache(inMemoryCache, 0),
+		cachev3.NewSegmentUsersCache(inMemoryCache, 0),
+		logger,
+	)
+	go func() {
+		if err := rateLimitedPuller.Run(ctx); err != nil {
+			logger.Error("Domain event puller stopped", zap.Error(err))
+		}
+	}()
+	go func() {
+		if err := invalidator.Run(ctx, rateLimitedPuller.MessageCh()); err != nil {
+			logger.Error("Cache invalidator stopped", zap.Error(err))
+		}
+	}()
+	logger.Debug("Cache invalidator started",
+		zap.String("hostname", hostname),
+		zap.String("subscription", subscription),
+		zap.String("topic", *s.domainTopic),
+	)
 	return nil
 }
 
