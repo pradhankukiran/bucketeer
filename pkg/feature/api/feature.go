@@ -470,16 +470,7 @@ func (s *FeatureService) listFeatures(
 			Value:    time.Now().Add(-activeDays).Unix(),
 		})
 	}
-	var existsFilters []*mysql.ExistsFilter
-	if hasAutoOps != nil {
-		existsFilters = append(existsFilters, &mysql.ExistsFilter{
-			Subquery: "SELECT 1 FROM auto_ops_rule " +
-				"WHERE feature_id = feature.id " +
-				"AND environment_id = feature.environment_id " +
-				"AND deleted = 0",
-			NotExists: !hasAutoOps.Value,
-		})
-	}
+	existsFilters, orFilters := buildHasAutoOpsFilters(hasAutoOps)
 	orders, err := s.newListFeaturesOrdersMySQL(orderBy, orderDirection)
 	if err != nil {
 		s.logger.Error(
@@ -506,6 +497,7 @@ func (s *FeatureService) listFeatures(
 		NullFilters:   nullFilters,
 		ExistsFilters: existsFilters,
 		InFilters:     nil,
+		OrFilters:     orFilters,
 		SearchQuery:   searchQuery,
 		Limit:         limit,
 		Offset:        offset,
@@ -651,16 +643,7 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 			Value:    time.Now().Add(-activeDays).Unix(),
 		})
 	}
-	var existsFilters []*mysql.ExistsFilter
-	if hasAutoOps != nil {
-		existsFilters = append(existsFilters, &mysql.ExistsFilter{
-			Subquery: "SELECT 1 FROM auto_ops_rule " +
-				"WHERE feature_id = feature.id " +
-				"AND environment_id = feature.environment_id " +
-				"AND deleted = 0",
-			NotExists: !hasAutoOps.Value,
-		})
-	}
+	existsFilters, orFilters := buildHasAutoOpsFilters(hasAutoOps)
 	orders, err := s.newListFeaturesOrdersMySQL(orderBy, orderDirection)
 	if err != nil {
 		s.logger.Error(
@@ -688,6 +671,7 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 		NullFilters:   nullFilters,
 		ExistsFilters: existsFilters,
 		InFilters:     nil,
+		OrFilters:     orFilters,
 		SearchQuery:   searchQuery,
 		Limit:         limit,
 		Offset:        offset,
@@ -704,6 +688,42 @@ func (s *FeatureService) listFeaturesFilteredByExperiment(
 		return nil, "", 0, err
 	}
 	return features, strconv.Itoa(nextCursor), totalCount, nil
+}
+
+func buildHasAutoOpsFilters(hasAutoOps *wrappers.BoolValue) ([]*mysql.ExistsFilter, []*mysql.OrFilter) {
+	if hasAutoOps == nil {
+		return nil, nil
+	}
+
+	autoOpsRuleSubquery := "SELECT 1 FROM auto_ops_rule " +
+		"WHERE feature_id = feature.id " +
+		"AND environment_id = feature.environment_id " +
+		"AND deleted = 0"
+	progressiveRolloutSubquery := "SELECT 1 FROM ops_progressive_rollout " +
+		"WHERE feature_id = feature.id " +
+		"AND environment_id = feature.environment_id"
+
+	if hasAutoOps.Value {
+		return nil, []*mysql.OrFilter{
+			{
+				Queries: []mysql.WherePart{
+					&mysql.ExistsFilter{Subquery: autoOpsRuleSubquery},
+					&mysql.ExistsFilter{Subquery: progressiveRolloutSubquery},
+				},
+			},
+		}
+	}
+
+	return []*mysql.ExistsFilter{
+		{
+			Subquery:  autoOpsRuleSubquery,
+			NotExists: true,
+		},
+		{
+			Subquery:  progressiveRolloutSubquery,
+			NotExists: true,
+		},
+	}, nil
 }
 
 func (s *FeatureService) newListFeaturesOrdersMySQL(

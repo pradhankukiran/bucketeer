@@ -275,6 +275,41 @@ func TestExistsFilterSQLString(t *testing.T) {
 	}
 }
 
+func TestOrFilterSQLString(t *testing.T) {
+	t.Parallel()
+	patterns := []struct {
+		desc         string
+		input        *OrFilter
+		expectedSQL  string
+		expectedArgs []interface{}
+	}{
+		{
+			desc:         "Empty",
+			input:        &OrFilter{},
+			expectedSQL:  "",
+			expectedArgs: nil,
+		},
+		{
+			desc: "Success",
+			input: &OrFilter{
+				Queries: []WherePart{
+					NewFilter("name", "=", "feature"),
+					NewFilter("id", "=", "feature-1"),
+				},
+			},
+			expectedSQL:  "(name = ? OR id = ?)",
+			expectedArgs: []interface{}{"feature", "feature-1"},
+		},
+	}
+	for _, p := range patterns {
+		t.Run(p.desc, func(t *testing.T) {
+			sql, args := p.input.SQLString()
+			assert.Equal(t, p.expectedSQL, sql)
+			assert.Equal(t, p.expectedArgs, args)
+		})
+	}
+}
+
 func TestSearchQuerySQLString(t *testing.T) {
 	t.Parallel()
 	patterns := []struct {
@@ -330,6 +365,20 @@ func TestConstructWhereSQLString(t *testing.T) {
 			},
 			expectedSQL:  " WHERE name = ? AND JSON_CONTAINS(enums, ?) ",
 			expectedArgs: []interface{}{"feature", "[1, 3]"},
+		},
+		{
+			desc: "Success with or filter",
+			input: []WherePart{
+				NewFilter("deleted", "=", false),
+				&OrFilter{
+					Queries: []WherePart{
+						NewFilter("name", "=", "feature"),
+						NewFilter("id", "=", "feature-1"),
+					},
+				},
+			},
+			expectedSQL:  " WHERE deleted = ? AND (name = ? OR id = ?) ",
+			expectedArgs: []interface{}{false, "feature", "feature-1"},
 		},
 	}
 	for _, p := range patterns {

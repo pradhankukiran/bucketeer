@@ -641,9 +641,11 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 	defer cancel()
 
 	// Create features
-	featureWithAutoOps := newFeatureID(t)
+	featureWithScheduleAutoOps := newFeatureID(t)
+	featureWithProgressiveRollout := newFeatureID(t)
 	featureWithoutAutoOps := newFeatureID(t)
-	createFeature(t, client, newCreateFeatureReq(featureWithAutoOps))
+	createFeature(t, client, newCreateFeatureReq(featureWithScheduleAutoOps))
+	createFeature(t, client, newCreateFeatureReq(featureWithProgressiveRollout))
 	createFeature(t, client, newCreateFeatureReq(featureWithoutAutoOps))
 
 	// Attach a schedule auto ops rule to one feature
@@ -651,7 +653,7 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 		ctx,
 		t,
 		aoClient,
-		featureWithAutoOps,
+		featureWithScheduleAutoOps,
 		aoproto.OpsType_SCHEDULE,
 		nil,
 		[]*aoproto.DatetimeClause{
@@ -660,6 +662,23 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 				ActionType: aoproto.ActionType_DISABLE,
 			},
 		},
+	)
+	progressiveRolloutFeature := getFeature(t, featureWithProgressiveRollout, client)
+	createProgressiveRollout(
+		ctx,
+		t,
+		aoClient,
+		featureWithProgressiveRollout,
+		&aoproto.ProgressiveRolloutManualScheduleClause{
+			Schedules: []*aoproto.ProgressiveRolloutSchedule{
+				{
+					Weight:    50000,
+					ExecuteAt: time.Now().Add(10 * time.Minute).Unix(),
+				},
+			},
+			VariationId: progressiveRolloutFeature.Variations[0].Id,
+		},
+		nil,
 	)
 
 	// Filter: has_auto_ops = true
@@ -670,17 +689,24 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundWithAutoOps := false
+	foundWithScheduleAutoOps := false
+	foundWithProgressiveRollout := false
 	for _, f := range trueResp.Features {
-		if f.Id == featureWithAutoOps {
-			foundWithAutoOps = true
+		if f.Id == featureWithScheduleAutoOps {
+			foundWithScheduleAutoOps = true
+		}
+		if f.Id == featureWithProgressiveRollout {
+			foundWithProgressiveRollout = true
 		}
 		if f.Id == featureWithoutAutoOps {
 			t.Errorf("Feature %s should not appear when filtering has_auto_ops=true", featureWithoutAutoOps)
 		}
 	}
-	if !foundWithAutoOps {
-		t.Errorf("Feature %s should appear when filtering has_auto_ops=true", featureWithAutoOps)
+	if !foundWithScheduleAutoOps {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true", featureWithScheduleAutoOps)
+	}
+	if !foundWithProgressiveRollout {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true", featureWithProgressiveRollout)
 	}
 
 	// Filter: has_auto_ops = false
@@ -693,8 +719,11 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 	}
 	foundWithoutAutoOps := false
 	for _, f := range falseResp.Features {
-		if f.Id == featureWithAutoOps {
-			t.Errorf("Feature %s should not appear when filtering has_auto_ops=false", featureWithAutoOps)
+		if f.Id == featureWithScheduleAutoOps {
+			t.Errorf("Feature %s should not appear when filtering has_auto_ops=false", featureWithScheduleAutoOps)
+		}
+		if f.Id == featureWithProgressiveRollout {
+			t.Errorf("Feature %s should not appear when filtering has_auto_ops=false", featureWithProgressiveRollout)
 		}
 		if f.Id == featureWithoutAutoOps {
 			foundWithoutAutoOps = true
@@ -713,17 +742,24 @@ func TestListFeaturesFilterHasAutoOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundWithAutoOpsInExpPath := false
+	foundWithScheduleAutoOpsInExpPath := false
+	foundWithProgressiveRolloutInExpPath := false
 	for _, f := range experimentResp.Features {
-		if f.Id == featureWithAutoOps {
-			foundWithAutoOpsInExpPath = true
+		if f.Id == featureWithScheduleAutoOps {
+			foundWithScheduleAutoOpsInExpPath = true
+		}
+		if f.Id == featureWithProgressiveRollout {
+			foundWithProgressiveRolloutInExpPath = true
 		}
 		if f.Id == featureWithoutAutoOps {
 			t.Errorf("Feature %s should not appear when filtering has_auto_ops=true with has_experiment=false", featureWithoutAutoOps)
 		}
 	}
-	if !foundWithAutoOpsInExpPath {
-		t.Errorf("Feature %s should appear when filtering has_auto_ops=true with has_experiment=false", featureWithAutoOps)
+	if !foundWithScheduleAutoOpsInExpPath {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true with has_experiment=false", featureWithScheduleAutoOps)
+	}
+	if !foundWithProgressiveRolloutInExpPath {
+		t.Errorf("Feature %s should appear when filtering has_auto_ops=true with has_experiment=false", featureWithProgressiveRollout)
 	}
 }
 
