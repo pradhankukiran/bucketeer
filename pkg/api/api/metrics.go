@@ -160,6 +160,7 @@ const (
 	codeOld           = "Old"
 	codeInternalError = "InternalError"
 	codeBadRequest    = "BadRequest"
+	codeCanceled      = "Canceled"
 )
 
 var (
@@ -315,6 +316,13 @@ var (
 			Name:      "api_evaluation_event_error_reason_total",
 			Help:      "Total number of evaluation events with error reasons (user received default value)",
 		}, []string{"project_id", "environment_id", "tag", "reason_type", "sdk_version", "source_id"})
+	cacheInvalidationCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "bucketeer",
+			Subsystem: "gateway",
+			Name:      "api_cache_invalidation_total",
+			Help:      "Total number of in-memory cache invalidations triggered by domain events",
+		}, []string{"entity_type", "event_type", "environment_id"})
 )
 
 func registerMetrics(r metrics.Registerer) {
@@ -336,6 +344,7 @@ func registerMetrics(r metrics.Registerer) {
 			evaluationEventErrorReasonCounter,
 			handledSecondsHistogram,
 			apiErrorCounter,
+			cacheInvalidationCounter,
 		)
 	})
 }

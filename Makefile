@@ -479,10 +479,12 @@ setup-localenv:
 	kubectl delete pod -l app.kubernetes.io/name=vault --ignore-not-found=true
 	kubectl delete pod -l app.kubernetes.io/name=vault-agent-injector --ignore-not-found=true
 	kubectl delete pod -l app.kubernetes.io/name=postgresql --ignore-not-found=true
+	kubectl delete pod -l app.kubernetes.io/name=prometheus --ignore-not-found=true
 	@echo "Waiting for infrastructure pods to be ready..."
 	kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub --timeout=300s
 	kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=vault --timeout=300s
 	kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=vault-agent-injector --timeout=300s
+	kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus --timeout=300s
 	@if [ "$(POSTGRES_ENABLED)" = "true" ]; then \
 		kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=postgresql --timeout=300s; \
 	fi
@@ -528,12 +530,13 @@ build-docker-images:
 		docker build --platform $(PLATFORM) -f Dockerfile-app-$$APP -t ghcr.io/bucketeer-io/bucketeer-$$IMAGE:${TAG} .; \
 		rm Dockerfile-app-$$APP; \
 	done
-	docker build --platform $(PLATFORM) migration/ -t ghcr.io/bucketeer-io/bucketeer-migration:${TAG}
+	docker build --platform $(PLATFORM) -f migration/Dockerfile migration/ -t ghcr.io/bucketeer-io/bucketeer-migration:${TAG}
+	docker build --platform $(PLATFORM) -f migration/Dockerfile.postgres migration/ -t ghcr.io/bucketeer-io/bucketeer-migration-postgres:${TAG}
 
 # copy go application docker image to minikube
 # please keep the same TAG env as used in build-docker-images, eg: TAG=test make minikube-load-images
 minikube-load-images:
-	for APP in $$(ls bin) migration; do \
+	for APP in $$(ls bin) migration migration-postgres; do \
 		IMAGE=`./tools/build/show-image-name.sh $$APP`; \
 		docker save ghcr.io/bucketeer-io/bucketeer-$$IMAGE:${TAG} -o $$IMAGE.tar; \
 		docker cp $$IMAGE.tar minikube:/home/docker; \
